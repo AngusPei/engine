@@ -17,7 +17,7 @@
 #include "flutter/lib/ui/window/platform_message.h"
 #include "flutter/lib/ui/window/window.h"
 #include "fuchsia/ui/views/cpp/fidl.h"
-#include "googletest/googletest/include/gtest/gtest.h"
+#include "gtest/gtest.h"
 
 namespace flutter_runner_test::flutter_runner_a11y_test {
 
@@ -110,7 +110,8 @@ TEST_F(PlatformViewTests, ChangesAccessibilitySettings) {
       nullptr,  // session_metrics_did_change_callback
       nullptr,  // session_size_change_hint_callback
       nullptr,  // on_enable_wireframe_callback,
-      0u        // vsync_event_handle
+      0u,       // vsync_event_handle
+      {}        // product_config
   );
 
   RunLoopUntilIdle();
@@ -162,7 +163,8 @@ TEST_F(PlatformViewTests, EnableWireframeTest) {
       nullptr,                  // session_metrics_did_change_callback
       nullptr,                  // session_size_change_hint_callback
       EnableWireframeCallback,  // on_enable_wireframe_callback,
-      0u                        // vsync_event_handle
+      0u,                       // vsync_event_handle
+      {}                        // product_config
   );
 
   // Cast platform_view to its base view so we can have access to the public

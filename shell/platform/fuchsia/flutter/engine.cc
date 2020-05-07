@@ -5,6 +5,7 @@
 #include "engine.h"
 
 #include <lib/async/cpp/task.h>
+#include <lib/ui/scenic/cpp/view_ref_pair.h>
 #include <zircon/status.h>
 #include <sstream>
 
@@ -15,6 +16,7 @@
 #include "flutter/runtime/dart_vm_lifecycle.h"
 #include "flutter/shell/common/rasterizer.h"
 #include "flutter/shell/common/run_configuration.h"
+#include "flutter_runner_product_configuration.h"
 #include "fuchsia_intl.h"
 #include "platform_view.h"
 #include "runtime/dart/utils/files.h"
@@ -37,7 +39,7 @@ static void UpdateNativeThreadLabelNames(const std::string& label,
   };
   set_thread_name(runners.GetPlatformTaskRunner(), label, ".platform");
   set_thread_name(runners.GetUITaskRunner(), label, ".ui");
-  set_thread_name(runners.GetGPUTaskRunner(), label, ".gpu");
+  set_thread_name(runners.GetRasterTaskRunner(), label, ".raster");
   set_thread_name(runners.GetIOTaskRunner(), label, ".io");
 }
 
@@ -55,9 +57,9 @@ Engine::Engine(Delegate& delegate,
                flutter::Settings settings,
                fml::RefPtr<const flutter::DartSnapshot> isolate_snapshot,
                fuchsia::ui::views::ViewToken view_token,
-               scenic::ViewRefPair view_ref_pair,
                UniqueFDIONS fdio_ns,
-               fidl::InterfaceRequest<fuchsia::io::Directory> directory_request)
+               fidl::InterfaceRequest<fuchsia::io::Directory> directory_request,
+               FlutterRunnerProductConfiguration product_config)
     : delegate_(delegate),
       thread_label_(std::move(thread_label)),
       settings_(std::move(settings)),
@@ -113,8 +115,13 @@ Engine::Engine(Delegate& delegate,
         });
       };
 
+  auto view_ref_pair = scenic::ViewRefPair::New();
   fuchsia::ui::views::ViewRef view_ref;
   view_ref_pair.view_ref.Clone(&view_ref);
+
+  fuchsia::ui::views::ViewRef dart_view_ref;
+  view_ref_pair.view_ref.Clone(&dart_view_ref);
+  zx::eventpair dart_view_ref_event_pair(std::move(dart_view_ref.reference));
 
   // Setup the callback that will instantiate the platform view.
   flutter::Shell::CreateCallback<flutter::PlatformView>
@@ -132,7 +139,8 @@ Engine::Engine(Delegate& delegate,
                std::move(on_session_size_change_hint_callback),
            on_enable_wireframe_callback =
                std::move(on_enable_wireframe_callback),
-           vsync_handle = vsync_event_.get()](flutter::Shell& shell) mutable {
+           vsync_handle = vsync_event_.get(),
+           product_config = product_config](flutter::Shell& shell) mutable {
             return std::make_unique<flutter_runner::PlatformView>(
                 shell,                   // delegate
                 debug_label,             // debug label
@@ -145,11 +153,11 @@ Engine::Engine(Delegate& delegate,
                 std::move(on_session_metrics_change_callback),
                 std::move(on_session_size_change_hint_callback),
                 std::move(on_enable_wireframe_callback),
-                vsync_handle  // vsync handle
-            );
+                vsync_handle,  // vsync handle
+                product_config);
           });
 
-  // Session can be terminated on the GPU thread, but we must terminate
+  // Session can be terminated on the raster thread, but we must terminate
   // ourselves on the platform thread.
   //
   // This handles the fidl error callback when the Session connection is
@@ -170,7 +178,7 @@ Engine::Engine(Delegate& delegate,
   const flutter::TaskRunners task_runners(
       thread_label_,  // Dart thread labels
       CreateFMLTaskRunner(async_get_default_dispatcher()),  // platform
-      CreateFMLTaskRunner(threads_[0]->dispatcher()),       // gpu
+      CreateFMLTaskRunner(threads_[0]->dispatcher()),       // raster
       CreateFMLTaskRunner(threads_[1]->dispatcher()),       // ui
       CreateFMLTaskRunner(threads_[2]->dispatcher())        // io
   );
@@ -194,8 +202,7 @@ Engine::Engine(Delegate& delegate,
                   std::move(view_ref_pair),  // scenic view ref/view ref control
                   std::move(session),        // scenic session
                   on_session_error_callback,  // session did encounter error
-                  vsync_event                 // vsync event handle
-              );
+                  vsync_event);               // vsync event handle
         }
 
         return std::make_unique<flutter::Rasterizer>(
@@ -235,6 +242,7 @@ Engine::Engine(Delegate& delegate,
     TRACE_EVENT0("flutter", "CreateShell");
     shell_ = flutter::Shell::Create(
         task_runners,                 // host task runners
+        flutter::WindowData(),        // default window data
         settings_,                    // shell launch settings
         std::move(isolate_snapshot),  // isolate snapshot
         on_create_platform_view,      // platform view create callback
@@ -255,9 +263,10 @@ Engine::Engine(Delegate& delegate,
     svc->Connect(environment.NewRequest());
 
     isolate_configurator_ = std::make_unique<IsolateConfigurator>(
-        std::move(fdio_ns),              //
-        std::move(environment),          //
-        directory_request.TakeChannel()  //
+        std::move(fdio_ns),                  //
+        std::move(environment),              //
+        directory_request.TakeChannel(),     //
+        std::move(dart_view_ref_event_pair)  //
     );
   }
 
@@ -467,7 +476,7 @@ void Engine::OnSessionMetricsDidChange(
     return;
   }
 
-  shell_->GetTaskRunners().GetGPUTaskRunner()->PostTask(
+  shell_->GetTaskRunners().GetRasterTaskRunner()->PostTask(
       [rasterizer = shell_->GetRasterizer(), metrics]() {
         if (rasterizer) {
           auto compositor_context =
@@ -484,7 +493,7 @@ void Engine::OnDebugWireframeSettingsChanged(bool enabled) {
     return;
   }
 
-  shell_->GetTaskRunners().GetGPUTaskRunner()->PostTask(
+  shell_->GetTaskRunners().GetRasterTaskRunner()->PostTask(
       [rasterizer = shell_->GetRasterizer(), enabled]() {
         if (rasterizer) {
           auto compositor_context =
@@ -502,7 +511,7 @@ void Engine::OnSessionSizeChangeHint(float width_change_factor,
     return;
   }
 
-  shell_->GetTaskRunners().GetGPUTaskRunner()->PostTask(
+  shell_->GetTaskRunners().GetRasterTaskRunner()->PostTask(
       [rasterizer = shell_->GetRasterizer(), width_change_factor,
        height_change_factor]() {
         if (rasterizer) {
