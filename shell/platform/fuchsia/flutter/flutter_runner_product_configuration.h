@@ -4,6 +4,7 @@
 
 #ifndef FLUTTER_SHELL_PLATFORM_FUCHSIA_FLUTTER_RUNNER_PRODUCT_CONFIGURATION_H_
 #define FLUTTER_SHELL_PLATFORM_FUCHSIA_FLUTTER_RUNNER_PRODUCT_CONFIGURATION_H_
+
 #include "flutter/fml/time/time_delta.h"
 
 namespace flutter_runner {
@@ -14,9 +15,19 @@ class FlutterRunnerProductConfiguration {
   FlutterRunnerProductConfiguration(std::string path);
 
   fml::TimeDelta get_vsync_offset() { return vsync_offset_; }
+  uint64_t get_max_frames_in_flight() { return max_frames_in_flight_; }
+  bool get_intercept_all_input() { return intercept_all_input_; }
+  bool enable_shader_warmup() { return enable_shader_warmup_; }
+  bool enable_shader_warmup_dart_hooks() {
+    return enable_shader_warmup_dart_hooks_;
+  }
 
  private:
   fml::TimeDelta vsync_offset_ = fml::TimeDelta::Zero();
+  uint64_t max_frames_in_flight_ = 3;
+  bool intercept_all_input_ = false;
+  bool enable_shader_warmup_ = false;
+  bool enable_shader_warmup_dart_hooks_ = true;
 };
 
 }  // namespace flutter_runner

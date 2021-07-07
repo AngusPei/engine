@@ -2,10 +2,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include "flutter/shell/platform/darwin/ios/framework/Source/SemanticsObject.h"
+#import "flutter/shell/platform/darwin/ios/framework/Source/SemanticsObject.h"
 
 #include "flutter/fml/platform/darwin/scoped_nsobject.h"
-#include "flutter/shell/platform/darwin/ios/framework/Source/FlutterPlatformViews_Internal.h"
+#import "flutter/shell/platform/darwin/ios/framework/Source/FlutterPlatformViews_Internal.h"
 
 namespace {
 
@@ -34,23 +34,138 @@ flutter::SemanticsAction GetSemanticsActionForScrollDirection(
   return flutter::SemanticsAction::kScrollUp;
 }
 
+SkM44 GetGlobalTransform(SemanticsObject* reference) {
+  SkM44 globalTransform = [reference node].transform;
+  for (SemanticsObject* parent = [reference parent]; parent; parent = parent.parent) {
+    globalTransform = parent.node.transform * globalTransform;
+  }
+  return globalTransform;
+}
+
+SkPoint ApplyTransform(SkPoint& point, const SkM44& transform) {
+  SkV4 vector = transform.map(point.x(), point.y(), 0, 1);
+  return SkPoint::Make(vector.x / vector.w, vector.y / vector.w);
+}
+
+CGPoint ConvertPointToGlobal(SemanticsObject* reference, CGPoint local_point) {
+  SkM44 globalTransform = GetGlobalTransform(reference);
+  SkPoint point = SkPoint::Make(local_point.x, local_point.y);
+  point = ApplyTransform(point, globalTransform);
+  // `rect` is in the physical pixel coordinate system. iOS expects the accessibility frame in
+  // the logical pixel coordinate system. Therefore, we divide by the `scale` (pixel ratio) to
+  // convert.
+  CGFloat scale = [[[reference bridge]->view() window] screen].scale;
+  auto result = CGPointMake(point.x() / scale, point.y() / scale);
+  return [[reference bridge]->view() convertPoint:result toView:nil];
+}
+
+CGRect ConvertRectToGlobal(SemanticsObject* reference, CGRect local_rect) {
+  SkM44 globalTransform = GetGlobalTransform(reference);
+
+  SkPoint quad[4] = {
+      SkPoint::Make(local_rect.origin.x, local_rect.origin.y),                          // top left
+      SkPoint::Make(local_rect.origin.x + local_rect.size.width, local_rect.origin.y),  // top right
+      SkPoint::Make(local_rect.origin.x + local_rect.size.width,
+                    local_rect.origin.y + local_rect.size.height),  // bottom right
+      SkPoint::Make(local_rect.origin.x,
+                    local_rect.origin.y + local_rect.size.height)  // bottom left
+  };
+  for (auto& point : quad) {
+    point = ApplyTransform(point, globalTransform);
+  }
+  SkRect rect;
+  NSCAssert(rect.setBoundsCheck(quad, 4), @"Transformed points can't form a rect");
+  rect.setBounds(quad, 4);
+
+  // `rect` is in the physical pixel coordinate system. iOS expects the accessibility frame in
+  // the logical pixel coordinate system. Therefore, we divide by the `scale` (pixel ratio) to
+  // convert.
+  CGFloat scale = [[[reference bridge]->view() window] screen].scale;
+  auto result =
+      CGRectMake(rect.x() / scale, rect.y() / scale, rect.width() / scale, rect.height() / scale);
+  return UIAccessibilityConvertFrameToScreenCoordinates(result, [reference bridge]->view());
+}
+
 }  // namespace
 
 @implementation FlutterSwitchSemanticsObject {
-  SemanticsObject* _semanticsObject;
+  UISwitch* _nativeSwitch;
 }
 
-- (instancetype)initWithSemanticsObject:(SemanticsObject*)semanticsObject {
-  self = [super init];
+- (instancetype)initWithBridge:(fml::WeakPtr<flutter::AccessibilityBridgeIos>)bridge
+                           uid:(int32_t)uid {
+  self = [super initWithBridge:bridge uid:uid];
   if (self) {
-    _semanticsObject = [semanticsObject retain];
+    _nativeSwitch = [[[UISwitch alloc] init] retain];
   }
   return self;
 }
 
 - (void)dealloc {
-  [_semanticsObject release];
+  [_nativeSwitch release];
   [super dealloc];
+}
+
+- (NSMethodSignature*)methodSignatureForSelector:(SEL)sel {
+  NSMethodSignature* result = [super methodSignatureForSelector:sel];
+  if (!result) {
+    result = [_nativeSwitch methodSignatureForSelector:sel];
+  }
+  return result;
+}
+
+- (void)forwardInvocation:(NSInvocation*)anInvocation {
+  [anInvocation setTarget:_nativeSwitch];
+  [anInvocation invoke];
+}
+
+- (NSString*)accessibilityValue {
+  if ([self node].HasFlag(flutter::SemanticsFlags::kIsToggled) ||
+      [self node].HasFlag(flutter::SemanticsFlags::kIsChecked)) {
+    _nativeSwitch.on = YES;
+  } else {
+    _nativeSwitch.on = NO;
+  }
+
+  if (![self isAccessibilityBridgeAlive]) {
+    return nil;
+  } else {
+    return _nativeSwitch.accessibilityValue;
+  }
+}
+
+- (UIAccessibilityTraits)accessibilityTraits {
+  return _nativeSwitch.accessibilityTraits;
+}
+
+@end  // FlutterSwitchSemanticsObject
+
+@interface FlutterScrollableSemanticsObject ()
+@property(nonatomic, strong) SemanticsObject* semanticsObject;
+@end
+
+@implementation FlutterScrollableSemanticsObject {
+  fml::scoped_nsobject<SemanticsObjectContainer> _container;
+}
+
+- (instancetype)initWithSemanticsObject:(SemanticsObject*)semanticsObject {
+  self = [super initWithFrame:CGRectZero];
+  if (self) {
+    _semanticsObject = [semanticsObject retain];
+    [semanticsObject.bridge->view() addSubview:self];
+  }
+  return self;
+}
+
+- (void)dealloc {
+  _container.get().semanticsObject = nil;
+  [_semanticsObject release];
+  [self removeFromSuperview];
+  [super dealloc];
+}
+
+- (UIView*)hitTest:(CGPoint)point withEvent:(UIEvent*)event {
+  return nil;
 }
 
 - (NSMethodSignature*)methodSignatureForSelector:(SEL)sel {
@@ -66,85 +181,142 @@ flutter::SemanticsAction GetSemanticsActionForScrollDirection(
   [anInvocation invoke];
 }
 
-- (CGRect)accessibilityFrame {
-  return [_semanticsObject accessibilityFrame];
+- (void)accessibilityBridgeDidFinishUpdate {
+  // In order to make iOS think this UIScrollView is scrollable, the following
+  // requirements must be true.
+  // 1. contentSize must be bigger than the frame size.
+  // 2. The scrollable isAccessibilityElement must return YES
+  //
+  // Once the requirements are met, the iOS uses contentOffset to determine
+  // what scroll actions are available. e.g. If the view scrolls vertically and
+  // contentOffset is 0.0, only the scroll down action is available.
+  [self setFrame:[_semanticsObject accessibilityFrame]];
+  [self setContentSize:[self contentSizeInternal]];
+  [self setContentOffset:[self contentOffsetInternal] animated:NO];
+}
+
+- (void)setChildren:(NSArray<SemanticsObject*>*)children {
+  [_semanticsObject setChildren:children];
+  // The children's parent is pointing to _semanticsObject, need to manually
+  // set it this object.
+  for (SemanticsObject* child in _semanticsObject.children) {
+    child.parent = (SemanticsObject*)self;
+  }
 }
 
 - (id)accessibilityContainer {
-  return [_semanticsObject accessibilityContainer];
-}
-
-- (NSString*)accessibilityLabel {
-  return [_semanticsObject accessibilityLabel];
-}
-
-- (NSString*)accessibilityHint {
-  return [_semanticsObject accessibilityHint];
-}
-
-- (NSString*)accessibilityValue {
-  if ([_semanticsObject node].HasFlag(flutter::SemanticsFlags::kIsToggled) ||
-      [_semanticsObject node].HasFlag(flutter::SemanticsFlags::kIsChecked)) {
-    self.on = YES;
-  } else {
-    self.on = NO;
+  if (_container == nil) {
+    _container.reset([[SemanticsObjectContainer alloc]
+        initWithSemanticsObject:(SemanticsObject*)self
+                         bridge:[_semanticsObject bridge]]);
   }
+  return _container.get();
+}
 
+- (BOOL)isAccessibilityElement {
   if (![_semanticsObject isAccessibilityBridgeAlive]) {
-    return nil;
+    return NO;
+  }
+  if (self.contentSize.width > self.frame.size.width ||
+      self.contentSize.height > self.frame.size.height) {
+    return !_semanticsObject.bridge->isVoiceOverRunning();
   } else {
-    return [super accessibilityValue];
+    return NO;
   }
 }
 
-@end  // FlutterSwitchSemanticsObject
+// private methods
+
+- (float)scrollExtentMax {
+  if (![_semanticsObject isAccessibilityBridgeAlive]) {
+    return 0.0f;
+  }
+  float scrollExtentMax = _semanticsObject.node.scrollExtentMax;
+  if (isnan(scrollExtentMax)) {
+    scrollExtentMax = 0.0f;
+  } else if (!isfinite(scrollExtentMax)) {
+    scrollExtentMax = kScrollExtentMaxForInf + [self scrollPosition];
+  }
+  return scrollExtentMax;
+}
+
+- (float)scrollPosition {
+  if (![_semanticsObject isAccessibilityBridgeAlive]) {
+    return 0.0f;
+  }
+  float scrollPosition = _semanticsObject.node.scrollPosition;
+  if (isnan(scrollPosition)) {
+    scrollPosition = 0.0f;
+  }
+  NSCAssert(isfinite(scrollPosition), @"The scrollPosition must not be infinity");
+  return scrollPosition;
+}
+
+- (CGSize)contentSizeInternal {
+  CGRect result;
+  const SkRect& rect = _semanticsObject.node.rect;
+
+  if (_semanticsObject.node.actions & flutter::kVerticalScrollSemanticsActions) {
+    result = CGRectMake(rect.x(), rect.y(), rect.width(), rect.height() + [self scrollExtentMax]);
+  } else if (_semanticsObject.node.actions & flutter::kHorizontalScrollSemanticsActions) {
+    result = CGRectMake(rect.x(), rect.y(), rect.width() + [self scrollExtentMax], rect.height());
+  } else {
+    result = CGRectMake(rect.x(), rect.y(), rect.width(), rect.height());
+  }
+  return ConvertRectToGlobal(_semanticsObject, result).size;
+}
+
+- (CGPoint)contentOffsetInternal {
+  CGPoint result;
+  CGPoint origin = self.frame.origin;
+  const SkRect& rect = _semanticsObject.node.rect;
+  if (_semanticsObject.node.actions & flutter::kVerticalScrollSemanticsActions) {
+    result = ConvertPointToGlobal(_semanticsObject,
+                                  CGPointMake(rect.x(), rect.y() + [self scrollPosition]));
+  } else if (_semanticsObject.node.actions & flutter::kHorizontalScrollSemanticsActions) {
+    result = ConvertPointToGlobal(_semanticsObject,
+                                  CGPointMake(rect.x() + [self scrollPosition], rect.y()));
+  } else {
+    result = origin;
+  }
+  return CGPointMake(result.x - origin.x, result.y - origin.y);
+}
+
+// The following methods are explicitly forwarded to the wrapped SemanticsObject because the
+// forwarding logic above doesn't apply to them since they are also implemented in the
+// UIScrollView class, the base class.
+
+- (BOOL)accessibilityActivate {
+  return [_semanticsObject accessibilityActivate];
+}
+
+- (void)accessibilityIncrement {
+  [_semanticsObject accessibilityIncrement];
+}
+
+- (void)accessibilityDecrement {
+  [_semanticsObject accessibilityDecrement];
+}
+
+- (BOOL)accessibilityScroll:(UIAccessibilityScrollDirection)direction {
+  return [_semanticsObject accessibilityScroll:direction];
+}
+
+- (BOOL)accessibilityPerformEscape {
+  return [_semanticsObject accessibilityPerformEscape];
+}
+
+- (void)accessibilityElementDidBecomeFocused {
+  [_semanticsObject accessibilityElementDidBecomeFocused];
+}
+
+- (void)accessibilityElementDidLoseFocus {
+  [_semanticsObject accessibilityElementDidLoseFocus];
+}
+@end  // FlutterScrollableSemanticsObject
 
 @implementation FlutterCustomAccessibilityAction {
 }
-@end
-
-/**
- * Represents a semantics object that has children and hence has to be presented to the OS as a
- * UIAccessibilityContainer.
- *
- * The SemanticsObject class cannot implement the UIAccessibilityContainer protocol because an
- * object that returns YES for isAccessibilityElement cannot also implement
- * UIAccessibilityContainer.
- *
- * With the help of SemanticsObjectContainer, the hierarchy of semantic objects received from
- * the framework, such as:
- *
- * SemanticsObject1
- *     SemanticsObject2
- *         SemanticsObject3
- *         SemanticsObject4
- *
- * is translated into the following hierarchy, which is understood by iOS:
- *
- * SemanticsObjectContainer1
- *     SemanticsObject1
- *     SemanticsObjectContainer2
- *         SemanticsObject2
- *         SemanticsObject3
- *         SemanticsObject4
- *
- * From Flutter's view of the world (the first tree seen above), we construct iOS's view of the
- * world (second tree) as follows: We replace each SemanticsObjects that has children with a
- * SemanticsObjectContainer, which has the original SemanticsObject and its children as children.
- *
- * SemanticsObjects have semantic information attached to them which is interpreted by
- * VoiceOver (they return YES for isAccessibilityElement). The SemanticsObjectContainers are just
- * there for structure and they don't provide any semantic information to VoiceOver (they return
- * NO for isAccessibilityElement).
- */
-@interface SemanticsObjectContainer : UIAccessibilityElement
-- (instancetype)init __attribute__((unavailable("Use initWithSemanticsObject instead")));
-- (instancetype)initWithSemanticsObject:(SemanticsObject*)semanticsObject
-                                 bridge:(fml::WeakPtr<flutter::AccessibilityBridgeIos>)bridge
-    NS_DESIGNATED_INITIALIZER;
-
-@property(nonatomic, weak) SemanticsObject* semanticsObject;
-
 @end
 
 @interface SemanticsObject ()
@@ -199,7 +371,27 @@ flutter::SemanticsAction GetSemanticsActionForScrollDirection(
   [super dealloc];
 }
 
-#pragma mark - Semantic object methods
+#pragma mark - Semantic object property accesser
+
+- (void)setChildren:(NSArray<SemanticsObject*>*)children {
+  for (SemanticsObject* child in _children) {
+    [child privateSetParent:nil];
+  }
+  [_children release];
+  _children = [[NSMutableArray alloc] initWithArray:children];
+  for (SemanticsObject* child in _children) {
+    [child privateSetParent:self];
+  }
+}
+
+- (BOOL)hasChildren {
+  if (_node.IsPlatformViewNode()) {
+    return YES;
+  }
+  return [self.children count] != 0;
+}
+
+#pragma mark - Semantic object method
 
 - (BOOL)isAccessibilityBridgeAlive {
   return [self bridge].get() != nil;
@@ -207,6 +399,9 @@ flutter::SemanticsAction GetSemanticsActionForScrollDirection(
 
 - (void)setSemanticsNode:(const flutter::SemanticsNode*)node {
   _node = *node;
+}
+
+- (void)accessibilityBridgeDidFinishUpdate { /* Do nothing by default */
 }
 
 /**
@@ -224,26 +419,23 @@ flutter::SemanticsAction GetSemanticsActionForScrollDirection(
          [self node].scrollPosition != node->scrollPosition;
 }
 
-- (BOOL)hasChildren {
-  if (_node.IsPlatformViewNode()) {
+/**
+ * Whether calling `setSemanticsNode:` with `node` should trigger an
+ * announcement.
+ */
+- (BOOL)nodeShouldTriggerAnnouncement:(const flutter::SemanticsNode*)node {
+  // The node dropped the live region flag, if it ever had one.
+  if (!node || !node->HasFlag(flutter::SemanticsFlags::kIsLiveRegion)) {
+    return NO;
+  }
+
+  // The node has gained a new live region flag, always announce.
+  if (![self node].HasFlag(flutter::SemanticsFlags::kIsLiveRegion)) {
     return YES;
   }
-  return [self.children count] != 0;
-}
 
-- (void)privateSetParent:(SemanticsObject*)parent {
-  _parent = parent;
-}
-
-- (void)setChildren:(NSArray<SemanticsObject*>*)children {
-  for (SemanticsObject* child in _children) {
-    [child privateSetParent:nil];
-  }
-  [_children release];
-  _children = [[NSMutableArray alloc] initWithArray:children];
-  for (SemanticsObject* child in _children) {
-    [child privateSetParent:self];
-  }
+  // The label has updated, and the new node has a live region flag.
+  return [self node].label != node->label;
 }
 
 - (void)replaceChildAtIndex:(NSInteger)index withChild:(SemanticsObject*)child {
@@ -251,6 +443,63 @@ flutter::SemanticsAction GetSemanticsActionForScrollDirection(
   [oldChild privateSetParent:nil];
   [child privateSetParent:self];
   [_children replaceObjectAtIndex:index withObject:child];
+}
+
+- (NSString*)routeName {
+  // Returns the first non-null and non-empty semantic label of a child
+  // with an NamesRoute flag. Otherwise returns nil.
+  if ([self node].HasFlag(flutter::SemanticsFlags::kNamesRoute)) {
+    NSString* newName = [self accessibilityLabel];
+    if (newName != nil && [newName length] > 0) {
+      return newName;
+    }
+  }
+  if ([self hasChildren]) {
+    for (SemanticsObject* child in self.children) {
+      NSString* newName = [child routeName];
+      if (newName != nil && [newName length] > 0) {
+        return newName;
+      }
+    }
+  }
+  return nil;
+}
+
+#pragma mark - Semantic object private method
+
+- (void)privateSetParent:(SemanticsObject*)parent {
+  _parent = parent;
+}
+
+- (NSAttributedString*)createAttributedStringFromString:(NSString*)string
+                                         withAttributes:
+                                             (const flutter::StringAttributes&)attributes {
+  NSMutableAttributedString* attributedString =
+      [[NSMutableAttributedString alloc] initWithString:string];
+  for (const auto& attribute : attributes) {
+    NSRange range = NSMakeRange(attribute->start, attribute->end - attribute->start);
+    switch (attribute->type) {
+      case flutter::StringAttributeType::kLocale: {
+        std::shared_ptr<flutter::LocaleStringAttribute> locale_attribute =
+            std::static_pointer_cast<flutter::LocaleStringAttribute>(attribute);
+        NSDictionary* attributeDict = @{
+          UIAccessibilitySpeechAttributeLanguage : @(locale_attribute->locale.data()),
+        };
+        [attributedString setAttributes:attributeDict range:range];
+        break;
+      }
+      case flutter::StringAttributeType::kSpellOut: {
+        if (@available(iOS 13.0, *)) {
+          NSDictionary* attributeDict = @{
+            UIAccessibilitySpeechAttributeSpellOut : @YES,
+          };
+          [attributedString setAttributes:attributeDict range:range];
+        }
+        break;
+      }
+    }
+  }
+  return attributedString;
 }
 
 #pragma mark - UIAccessibility overrides
@@ -267,17 +516,16 @@ flutter::SemanticsAction GetSemanticsActionForScrollDirection(
   if ([self node].HasFlag(flutter::SemanticsFlags::kScopesRoute))
     return false;
 
-  // If the only flag(s) set are scrolling related AND
-  // The only flags set are not kIsHidden OR
-  // The node doesn't have a label, value, or hint OR
-  // The only actions set are scrolling related actions.
+  // If the node is scrollable AND hidden OR
+  // The node has a label, value, or hint OR
+  // The node has non-scrolling related actions.
   //
-  // The kIsHidden flag set with any other flag just means this node is now
+  // The kIsHidden flag set with the scrollable flag means this node is now
   // hidden but still is a valid target for a11y focus in the tree, e.g. a list
   // item that is currently off screen but the a11y navigation needs to know
   // about.
-  return (([self node].flags & ~flutter::kScrollableSemanticsFlags) != 0 &&
-          [self node].flags != static_cast<int32_t>(flutter::SemanticsFlags::kIsHidden)) ||
+  return (([self node].flags & flutter::kScrollableSemanticsFlags) != 0 &&
+          ([self node].flags & static_cast<int32_t>(flutter::SemanticsFlags::kIsHidden)) != 0) ||
          ![self node].label.empty() || ![self node].value.empty() || ![self node].hint.empty() ||
          ([self node].actions & ~flutter::kScrollableSemanticsActions) != 0;
 }
@@ -302,29 +550,10 @@ flutter::SemanticsAction GetSemanticsActionForScrollDirection(
   args.push_back(action_id >> 8);
   args.push_back(action_id >> 16);
   args.push_back(action_id >> 24);
-  [self bridge]->DispatchSemanticsAction([self uid], flutter::SemanticsAction::kCustomAction,
-                                         std::move(args));
+  [self bridge]->DispatchSemanticsAction(
+      [self uid], flutter::SemanticsAction::kCustomAction,
+      fml::MallocMapping::Copy(args.data(), args.size() * sizeof(uint8_t)));
   return YES;
-}
-
-- (NSString*)routeName {
-  // Returns the first non-null and non-empty semantic label of a child
-  // with an NamesRoute flag. Otherwise returns nil.
-  if ([self node].HasFlag(flutter::SemanticsFlags::kNamesRoute)) {
-    NSString* newName = [self accessibilityLabel];
-    if (newName != nil && [newName length] > 0) {
-      return newName;
-    }
-  }
-  if ([self hasChildren]) {
-    for (SemanticsObject* child in self.children) {
-      NSString* newName = [child routeName];
-      if (newName != nil && [newName length] > 0) {
-        return newName;
-      }
-    }
-  }
-  return nil;
 }
 
 - (NSString*)accessibilityLabel {
@@ -336,6 +565,13 @@ flutter::SemanticsAction GetSemanticsActionForScrollDirection(
   return @([self node].label.data());
 }
 
+- (NSAttributedString*)accessibilityAttributedLabel {
+  NSString* label = [self accessibilityLabel];
+  if (label.length == 0)
+    return nil;
+  return [self createAttributedStringFromString:label withAttributes:[self node].labelAttributes];
+}
+
 - (NSString*)accessibilityHint {
   if (![self isAccessibilityBridgeAlive])
     return nil;
@@ -343,6 +579,13 @@ flutter::SemanticsAction GetSemanticsActionForScrollDirection(
   if ([self node].hint.empty())
     return nil;
   return @([self node].hint.data());
+}
+
+- (NSAttributedString*)accessibilityAttributedHint {
+  NSString* hint = [self accessibilityHint];
+  if (hint.length == 0)
+    return nil;
+  return [self createAttributedStringFromString:hint withAttributes:[self node].hintAttributes];
 }
 
 - (NSString*)accessibilityValue {
@@ -367,6 +610,13 @@ flutter::SemanticsAction GetSemanticsActionForScrollDirection(
   return nil;
 }
 
+- (NSAttributedString*)accessibilityAttributedValue {
+  NSString* value = [self accessibilityValue];
+  if (value.length == 0)
+    return nil;
+  return [self createAttributedStringFromString:value withAttributes:[self node].valueAttributes];
+}
+
 - (CGRect)accessibilityFrame {
   if (![self isAccessibilityBridgeAlive])
     return CGRectMake(0, 0, 0, 0);
@@ -378,30 +628,17 @@ flutter::SemanticsAction GetSemanticsActionForScrollDirection(
 }
 
 - (CGRect)globalRect {
-  SkM44 globalTransform = [self node].transform;
-  for (SemanticsObject* parent = [self parent]; parent; parent = parent.parent) {
-    globalTransform = parent.node.transform * globalTransform;
-  }
-
-  SkPoint quad[4];
-  [self node].rect.toQuad(quad);
-  for (auto& point : quad) {
-    SkV4 vector = globalTransform.map(point.x(), point.y(), 0, 1);
-    point.set(vector.x / vector.w, vector.y / vector.w);
-  }
-  SkRect rect;
-  rect.setBounds(quad, 4);
-
-  // `rect` is in the physical pixel coordinate system. iOS expects the accessibility frame in
-  // the logical pixel coordinate system. Therefore, we divide by the `scale` (pixel ratio) to
-  // convert.
-  CGFloat scale = [[[self bridge]->view() window] screen].scale;
-  auto result =
-      CGRectMake(rect.x() / scale, rect.y() / scale, rect.width() / scale, rect.height() / scale);
-  return UIAccessibilityConvertFrameToScreenCoordinates(result, [self bridge]->view());
+  const SkRect& rect = [self node].rect;
+  CGRect localRect = CGRectMake(rect.x(), rect.y(), rect.width(), rect.height());
+  return ConvertRectToGlobal(self, localRect);
 }
 
 #pragma mark - UIAccessibilityElement protocol
+
+- (void)setAccessibilityContainer:(id)container {
+  // Explicit noop.  The containers are calculated lazily in `accessibilityContainer`.
+  // See also: https://github.com/flutter/flutter/issues/54366
+}
 
 - (id)accessibilityContainer {
   if ([self hasChildren] || [self uid] == kRootNodeId) {
@@ -472,7 +709,9 @@ flutter::SemanticsAction GetSemanticsActionForScrollDirection(
 - (void)accessibilityElementDidBecomeFocused {
   if (![self isAccessibilityBridgeAlive])
     return;
-  if ([self node].HasFlag(flutter::SemanticsFlags::kIsHidden)) {
+  [self bridge]->AccessibilityObjectDidBecomeFocused([self uid]);
+  if ([self node].HasFlag(flutter::SemanticsFlags::kIsHidden) ||
+      [self node].HasFlag(flutter::SemanticsFlags::kIsHeader)) {
     [self bridge]->DispatchSemanticsAction([self uid], flutter::SemanticsAction::kShowOnScreen);
   }
   if ([self node].HasAction(flutter::SemanticsAction::kDidGainAccessibilityFocus)) {
@@ -484,6 +723,7 @@ flutter::SemanticsAction GetSemanticsActionForScrollDirection(
 - (void)accessibilityElementDidLoseFocus {
   if (![self isAccessibilityBridgeAlive])
     return;
+  [self bridge]->AccessibilityObjectDidLoseFocus([self uid]);
   if ([self node].HasAction(flutter::SemanticsAction::kDidLoseAccessibilityFocus)) {
     [self bridge]->DispatchSemanticsAction([self uid],
                                            flutter::SemanticsAction::kDidLoseAccessibilityFocus);
@@ -547,15 +787,22 @@ flutter::SemanticsAction GetSemanticsActionForScrollDirection(
   if ([self node].HasFlag(flutter::SemanticsFlags::kIsLink)) {
     traits |= UIAccessibilityTraitLink;
   }
+  if (traits == UIAccessibilityTraitNone && ![self hasChildren] &&
+      [[self accessibilityLabel] length] != 0 &&
+      ![self node].HasFlag(flutter::SemanticsFlags::kIsTextField)) {
+    traits = UIAccessibilityTraitStaticText;
+  }
   return traits;
 }
 
 @end
 
-@implementation FlutterPlatformViewSemanticsContainer {
-  SemanticsObject* _semanticsObject;
-  UIView* _platformView;
-}
+@interface FlutterPlatformViewSemanticsContainer ()
+@property(nonatomic, assign) SemanticsObject* semanticsObject;
+@property(nonatomic, strong) UIView* platformView;
+@end
+
+@implementation FlutterPlatformViewSemanticsContainer
 
 // Method declared as unavailable in the interface
 - (instancetype)init {
@@ -572,15 +819,48 @@ flutter::SemanticsAction GetSemanticsActionForScrollDirection(
   // `accessibilityContainer` and `accessibilityElementAtIndex`.
   if (self = [super initWithAccessibilityContainer:object.bridge->view()]) {
     _semanticsObject = object;
-    flutter::FlutterPlatformViewsController* controller =
-        object.bridge->GetPlatformViewsController();
+    auto controller = object.bridge->GetPlatformViewsController();
     if (controller) {
-      _platformView = [controller->GetPlatformViewByID(object.node.platformViewId) view];
+      _platformView = [controller->GetPlatformViewByID(object.node.platformViewId) retain];
     }
-    self.accessibilityElements = @[ _semanticsObject, _platformView ];
   }
   return self;
 }
+
+- (void)dealloc {
+  [_platformView release];
+  _platformView = nil;
+  [super dealloc];
+}
+
+#pragma mark - UIAccessibilityContainer overrides
+
+- (NSInteger)accessibilityElementCount {
+  // This container should only contain 2 elements:
+  // 1. The semantic object that represents this container.
+  // 2. The platform view object.
+  return 2;
+}
+
+- (nullable id)accessibilityElementAtIndex:(NSInteger)index {
+  FML_DCHECK(index < 2);
+  if (index == 0) {
+    return _semanticsObject;
+  } else {
+    return _platformView;
+  }
+}
+
+- (NSInteger)indexOfAccessibilityElement:(id)element {
+  FML_DCHECK(element == _semanticsObject || element == _platformView);
+  if (element == _semanticsObject) {
+    return 0;
+  } else {
+    return 1;
+  }
+}
+
+#pragma mark - UIAccessibilityElement overrides
 
 - (CGRect)accessibilityFrame {
   return _semanticsObject.accessibilityFrame;

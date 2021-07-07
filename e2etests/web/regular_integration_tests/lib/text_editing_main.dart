@@ -4,21 +4,24 @@
 
 import 'package:flutter/material.dart';
 
-void main() => runApp(MyApp());
+void main() => runApp(const MyApp());
 
 class MyApp extends StatelessWidget {
+  const MyApp({Key? key}) : super(key: key);
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       key: const Key('mainapp'),
+      theme: ThemeData(fontFamily: 'RobotoMono'),
       title: 'Integration Test App',
-      home: MyHomePage(title: 'Integration Test App'),
+      home: const MyHomePage(title: 'Integration Test App'),
     );
   }
 }
 
 class MyHomePage extends StatefulWidget {
-  MyHomePage({Key key, this.title}) : super(key: key);
+  const MyHomePage({Key? key, required this.title}) : super(key: key);
 
   final String title;
 
@@ -27,8 +30,16 @@ class MyHomePage extends StatefulWidget {
 }
 
 class _MyHomePageState extends State<MyHomePage> {
+  String infoText = 'no-enter';
+
+  // Controller with no initial value;
+  final TextEditingController _emptyController = TextEditingController();
+
   final TextEditingController _controller =
       TextEditingController(text: 'Text1');
+
+  final TextEditingController _controller2 =
+      TextEditingController(text: 'Text2');
 
   @override
   Widget build(BuildContext context) {
@@ -41,15 +52,55 @@ class _MyHomePageState extends State<MyHomePage> {
           mainAxisAlignment: MainAxisAlignment.center,
           children: <Widget>[
             const Text(
-              'Text Editing Test',
+              'Text Editing Test 1',
+            ),
+            TextFormField(
+              key: const Key('empty-input'),
+              enabled: true,
+              controller: _emptyController,
+              decoration: const InputDecoration(
+                contentPadding: EdgeInsets.all(10.0),
+                labelText: 'Empty Input Field:',
+              ),
+            ),
+            const Text(
+              'Text Editing Test 2',
             ),
             TextFormField(
               key: const Key('input'),
               enabled: true,
               controller: _controller,
-              //initialValue: 'Text1',
               decoration: const InputDecoration(
+                contentPadding: EdgeInsets.all(10.0),
                 labelText: 'Text Input Field:',
+              ),
+            ),
+            const Text(
+              'Text Editing Test 3',
+            ),
+            TextFormField(
+              key: const Key('input2'),
+              enabled: true,
+              controller: _controller2,
+              decoration: const InputDecoration(
+                contentPadding: EdgeInsets.all(10.0),
+                labelText: 'Text Input Field 2:',
+              ),
+              onFieldSubmitted: (String str) {
+                print('event received');
+                setState(() => infoText = 'enter pressed');
+              },
+            ),
+            Text(
+              infoText,
+              key: const Key('text'),
+            ),
+            const Padding(
+              padding: EdgeInsets.all(12.0),
+              child: SelectableText(
+                'Lorem ipsum dolor sit amet',
+                key: Key('selectable'),
+                style: TextStyle(fontFamily: 'RobotoMono', fontSize: 20.0),
               ),
             ),
           ],
